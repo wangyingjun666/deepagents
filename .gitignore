@@ -1,0 +1,29 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---------- 密钥（重要：绝不提交） ----------
+.env
+.env.local
+.env.*.local
+
+# ---------- 前端（Node） ----------
+ui/node_modules/
+ui/dist/
+ui/*.tsbuildinfo
+
+# ---------- 运行时自动生成的目录（首次运行自动创建） ----------
+output/
+updated/
+log/
+
+# ---------- IDE / 系统 ----------
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db

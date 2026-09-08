@@ -1,0 +1,45 @@
+# ============ DeepAgents 深度搜索项目 · 依赖清单 ============
+# 版本取自已验证可用的 deep_search_pro3 组合（去掉无关的 PDF 引擎包，安装更快更稳）
+# 安装：pip install -r requirements.txt
+# 国内可先执行：pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+
+# --- [核心] DeepAgents 框架 ---
+deepagents==0.4.3
+
+# --- LangChain / LangGraph 生态 ---
+langchain==1.2.10
+langchain-core==1.2.14
+langchain-openai==1.1.10
+langgraph==1.0.9
+langgraph-checkpoint==4.0.0
+langgraph-prebuilt==1.0.8
+langgraph-sdk==0.3.8
+openai==2.21.0
+tiktoken==0.12.0
+
+# --- Web 服务（后端 API + WebSocket）---
+fastapi==0.129.2
+uvicorn[standard]==0.41.0
+python-multipart==0.0.22
+pydantic==2.12.5
+pydantic-settings==2.13.1
+aiofiles==25.1.0
+
+# --- 外部服务集成 ---
+tavily-python==0.7.21          # 联网搜索（可选）
+ragflow-sdk==0.24.0            # RAGFlow 知识库（可选）
+mysql-connector-python==9.6.0  # MySQL 数据库
+
+# --- 配置文件 / 请求 ---
+python-dotenv==1.2.1
+PyYAML==6.0.3
+requests==2.32.5
+typing-extensions==4.15.0
+
+# --- 文件处理（Markdown / Word / PDF / Excel 读取）---
+markdown==3.10.2               # MD -> HTML（Word 转 PDF 用）
+python-docx==1.2.0             # Word 读取
+pypdf==6.7.2                   # PDF 读取
+pandas==3.0.1                  # Excel 读取
+openpyxl==3.1.5                # Excel 引擎
+pywin32==311                   # 调用本机 Microsoft Word 转 PDF（需电脑装有 Office）
