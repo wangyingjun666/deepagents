@@ -1,0 +1,52 @@
+# ---------------------------------------------------------------------------
+# KEEP THIS FILE ASCII-ONLY. Do not add Chinese (or any non-ASCII) text here.
+#
+# Why: docker-py reads this file with `open(dockerignore)` and NO encoding
+# argument (docker/api/build.py:153), so it is decoded with the OS locale
+# codec (GBK on a Chinese Windows). UTF-8 Chinese bytes then raise
+# UnicodeDecodeError and the build dies before it starts.
+#
+# The build only needs three files:
+#   sandbox/worker/Dockerfile   sandbox/worker/ops.py   security/path_guard.py
+# Everything else is excluded so node_modules / virtualenvs / run artifacts
+# never get shipped to the docker daemon.
+# ---------------------------------------------------------------------------
+
+# --- Dependencies and virtualenvs ---
+.venv/
+venv/
+ui/node_modules/
+ui/dist/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# --- Run artifacts (grow over time, must never enter the image) ---
+logs/
+log/
+output/
+updated/
+data/
+*.vhdx
+
+# --- Editors and VCS ---
+.idea/
+.vscode/
+.git/
+.gitignore
+
+# --- Secrets: .env holds DB passwords and API keys ---
+.env
+.env.*
+!.env.example
+
+# --- Documents and deliverables ---
+*.pdf
+*.docx
+*.md
+!sandbox/worker/*.md
+
+# --- Tests and frontend sources ---
+tests/
+ui/src/
+ui/public/

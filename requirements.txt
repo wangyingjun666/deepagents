@@ -1,5 +1,4 @@
 # ============ DeepAgents 深度搜索项目 · 依赖清单 ============
-# 版本取自已验证可用的 deep_search_pro3 组合（去掉无关的 PDF 引擎包，安装更快更稳）
 # 安装：pip install -r requirements.txt
 # 国内可先执行：pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
 
@@ -30,16 +29,22 @@ tavily-python==0.7.21          # 联网搜索（可选）
 ragflow-sdk==0.24.0            # RAGFlow 知识库（可选）
 mysql-connector-python==9.6.0  # MySQL 数据库
 
-# --- 配置文件 / 请求 ---
+# --- 配置 / 请求 ---
 python-dotenv==1.2.1
 PyYAML==6.0.3
 requests==2.32.5
 typing-extensions==4.15.0
 
 # --- 文件处理（Markdown / Word / PDF / Excel 读取）---
-markdown==3.10.2               # MD -> HTML（Word 转 PDF 用）
+markdown==3.10.2               # MD -> HTML 中转，PDF 渲染用
 python-docx==1.2.0             # Word 读取
 pypdf==6.7.2                   # PDF 读取
 pandas==3.0.1                  # Excel 读取
 openpyxl==3.1.5                # Excel 引擎
-pywin32==311                   # 调用本机 Microsoft Word 转 PDF（需电脑装有 Office）
+pywin32==311                   # 本机 Word COM 转 PDF，仅在无 Docker 时兜底（需装 Office）
+
+# --- 沙箱 / 安全 / 可观测 / 并发治理 ---
+docker==7.2.0                  # 容器沙箱后端（每会话一个隔离容器）
+sqlparse==0.6.0                # SQL 策略守卫：语句类型判定与表名抽取
+langgraph-checkpoint-sqlite==3.1.1  # 持久化会话状态（中断恢复 / 重启不丢）
+aiosqlite==0.22.1              # 上者的异步依赖

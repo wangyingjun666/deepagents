@@ -39,6 +39,16 @@ const fileList = ref<any[]>([])
 // 生成一个持久的会话ID，如果页面不刷新，ID不变
 const currentThreadId = ref(crypto.randomUUID())
 
+// --- 可观测：断线重连补发的游标 ---
+// 每收到一条事件就更新它；重连时带在 URL 上，服务端把断线期间的事件补发回来。
+// 没有这个游标，用户切个网络/睡个觉回来，中间发生的事就永久丢了。
+const lastEventId = ref(0)
+
+// --- 人工审批：待确认的高风险操作 ---
+// 后端在需要人工确认的操作前会挂起 Agent，并推一条 approval_required 过来。
+const pendingApproval = ref<any | null>(null)
+const approvalHistory = ref<any[]>([])
+
 // Helper: Scroll to bottom
 const scrollToBottom = async () => {
   await nextTick()
@@ -68,7 +78,10 @@ const fetchFiles = async () => {
 
 // WebSocket Connection
 const connectWebSocket = () => {
-  const ws = new WebSocket(`ws://localhost:8000/ws/${currentThreadId.value}`)
+  // 带上 after_event_id：重连时服务端会把断线期间的事件补发回来
+  const ws = new WebSocket(
+    `ws://localhost:8000/ws/${currentThreadId.value}?after_event_id=${lastEventId.value}`
+  )
 
   ws.onopen = () => {
     console.log('WebSocket Connected')
@@ -95,10 +108,35 @@ const connectWebSocket = () => {
 const handleSocketMessage = (data: any) => {
   const { type, event, message, data: eventData } = data
 
-  if (type === 'pong') return
+  if (type === 'pong') {
+    // 心跳响应里也带 last_event_id，用它校准游标
+    if (typeof data.last_event_id === 'number') {
+      lastEventId.value = Math.max(lastEventId.value, data.last_event_id)
+    }
+    return
+  }
+
+  // 更新重连游标：只要来了一条更新的事件，游标就前进
+  if (typeof data.event_id === 'number' && data.event_id > lastEventId.value) {
+    lastEventId.value = data.event_id
+  }
+
+  // 断线重连后的批量补发：把每条历史事件重新走一遍分发逻辑
+  if (event === 'replay') {
+    const missed = eventData?.events || []
+    if (missed.length) {
+      missed.forEach((e: any) => handleSocketMessage(e))
+      messages.value.push({
+        role: 'system',
+        content: `已补发 ${missed.length} 条断线期间的事件`,
+        timestamp: Date.now()
+      })
+    }
+    return
+  }
 
   let lastAiMsg = messages.value.slice().reverse().find(m => m.role === 'ai')
-  
+
   if (event === 'session_created') {
     currentSessionPath.value = eventData.path
     const parts = eventData.path.split(/output[\\/]/)
@@ -172,8 +210,78 @@ const handleSocketMessage = (data: any) => {
       timestamp: Date.now()
     })
     status.value = 'idle'
+  } else if (event === 'tool_end') {
+    // 工具执行完成，带耗时——这是"性能可观测"在前端的落点
+    if (lastAiMsg?.logs) {
+      lastAiMsg.logs.push({
+        type: 'tool',
+        title: `完成： ${eventData.tool_name}（${data.duration_ms}ms）`,
+        details: eventData.result_preview,
+        timestamp: new Date().toLocaleTimeString()
+      })
+    }
+  } else if (event === 'sandbox_ready') {
+    // 沙箱就绪：把"当前会话是否处于真隔离"明确告诉用户，而不是藏在日志里
+    const isolated = !!eventData.isolated
+    messages.value.push({
+      role: 'system',
+      content: isolated
+        ? `执行环境就绪：容器隔离（${eventData.backend}）`
+        : `执行环境就绪：${eventData.backend} —— 非容器隔离，隔离强度降低`,
+      timestamp: Date.now()
+    })
+  } else if (event === 'queued') {
+    messages.value.push({
+      role: 'system',
+      content: `任务排队中：等待 ${Math.round((eventData.wait_ms || 0) / 100) / 10}s 后开始执行`,
+      timestamp: Date.now()
+    })
+  } else if (event === 'retry') {
+    if (lastAiMsg) {
+      if (!lastAiMsg.logs) lastAiMsg.logs = []
+      lastAiMsg.logs.push({
+        type: 'agent',
+        title: `重试（第 ${eventData.attempt} 次，${eventData.delay}s 后）`,
+        details: eventData.error,
+        timestamp: new Date().toLocaleTimeString()
+      })
+    }
+  } else if (event === 'circuit_open') {
+    messages.value.push({
+      role: 'system',
+      content: `下游 ${eventData.name || ''} 触发熔断，${eventData.cooldown_sec}s 内快速失败`,
+      timestamp: Date.now()
+    })
+  } else if (event === 'sql_rejected' || event === 'path_denied' || event === 'permission_denied'
+             || event === 'sandbox_denied') {
+    // 安全拦截事件：让用户看到"系统刚刚拦下了一个操作"，以及为什么
+    messages.value.push({
+      role: 'system',
+      content: `安全拦截：${message}`,
+      timestamp: Date.now()
+    })
+    if (lastAiMsg) {
+      if (!lastAiMsg.logs) lastAiMsg.logs = []
+      lastAiMsg.logs.push({
+        type: 'security',
+        title: `已拦截： ${event}`,
+        details: eventData,
+        timestamp: new Date().toLocaleTimeString()
+      })
+    }
+  } else if (event === 'approval_required') {
+    // 人工审批：把高风险操作摆到用户面前，Agent 已经挂起在等这个决定
+    pendingApproval.value = eventData
+    messages.value.push({
+      role: 'system',
+      content: `操作「${eventData.tool_name}」需要你确认后才执行（${eventData.timeout_sec}s 内未确认将自动拒绝）`,
+      timestamp: Date.now()
+    })
+  } else if (event === 'approval_resolved') {
+    pendingApproval.value = null
+    approvalHistory.value.push(eventData)
   }
-  
+
   scrollToBottom()
 }
 
@@ -320,6 +428,22 @@ const removeFile = (index: number) => {
   selectedFiles.value.splice(index, 1)
 }
 
+// --- 人工审批：把用户的决定回传给服务端，挂起的 Agent 会从断点继续 ---
+const submitApproval = async (decision: 'approve' | 'reject') => {
+  const approval = pendingApproval.value
+  if (!approval) return
+  try {
+    await axios.post(`http://localhost:8000/api/approvals/${approval.approval_id}`, {
+      decision,
+      by: 'user'
+    })
+  } catch (e) {
+    console.error('提交审批决议失败', e)
+  } finally {
+    pendingApproval.value = null
+  }
+}
+
 const renderMarkdown = (text: string) => {
   if (!text) return '<span class="typing-indicator">Thinking...</span>'
   return marked(text)
@@ -429,6 +553,23 @@ onMounted(() => {
 
       <!-- Input Area -->
       <footer class="input-footer">
+        <!-- 人工审批：Agent 已挂起在等高危操作的决议 -->
+        <div v-if="pendingApproval" class="approval-panel">
+          <div class="approval-header">
+            <span class="approval-badge">需要确认</span>
+            <span class="approval-tool">{{ pendingApproval.tool_name }}</span>
+          </div>
+          <div class="approval-reason">{{ pendingApproval.reason }}</div>
+          <pre class="approval-args">{{ JSON.stringify(pendingApproval.args, null, 2) }}</pre>
+          <div class="approval-hint">
+            超过 {{ pendingApproval.timeout_sec }} 秒未确认将按「拒绝」处理
+          </div>
+          <div class="approval-actions">
+            <button class="approval-reject" @click="submitApproval('reject')">拒绝</button>
+            <button class="approval-approve" @click="submitApproval('approve')">同意执行</button>
+          </div>
+        </div>
+
         <!-- File Preview Tab -->
         <div v-if="selectedFiles.length > 0" class="file-preview-container">
           <div v-for="(file, index) in selectedFiles" :key="index" class="file-preview-chip">
@@ -1069,4 +1210,35 @@ textarea {
 ::-webkit-scrollbar-thumb:hover {
   background: #555;
 }
+
+/* --- 人工审批面板 --- */
+.approval-panel {
+  margin: 8px 0 10px;
+  padding: 12px 14px;
+  border: 1px solid #e8b339;
+  border-left: 4px solid #e8b339;
+  border-radius: 6px;
+  background: #fffbf0;
+}
+.approval-header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.approval-badge {
+  background: #e8b339; color: #fff; font-size: 11px;
+  padding: 2px 8px; border-radius: 10px;
+}
+.approval-tool { font-weight: 600; font-family: Consolas, monospace; font-size: 13px; }
+.approval-reason { font-size: 12px; color: #6b5a2e; margin-bottom: 6px; }
+.approval-args {
+  background: #fff; border: 1px solid #eee; border-radius: 4px;
+  padding: 8px; font-size: 11px; max-height: 160px; overflow: auto;
+  white-space: pre-wrap; word-break: break-all; margin: 0 0 6px;
+}
+.approval-hint { font-size: 11px; color: #a08a52; margin-bottom: 8px; }
+.approval-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.approval-actions button {
+  padding: 6px 16px; border-radius: 5px; border: 1px solid transparent;
+  cursor: pointer; font-size: 13px;
+}
+.approval-reject { background: #fff; border-color: #ccc; color: #444; }
+.approval-approve { background: #2c5aa0; color: #fff; }
+.approval-actions button:hover { opacity: .88; }
 </style>

@@ -1,6 +1,25 @@
-from agent.subagents.knowledge_base_agent import knowledge_base_agent
-from agent.subagents.database_query_agent import database_query_agent
-from agent.subagents.network_search_agent import network_search_agent
+"""
+主智能体：编排、会话生命周期、沙箱、权限与人工审批的汇合点。
+
+一次任务执行的链路：
+    ① 并发闸门（session_limiter）：全局会话数上限，超了排队
+    ② 准备会话资源：工作目录、上传件目录
+    ③ 建立安全主体（principal）：这个会话是谁、什么角色、有哪些能力
+    ④ 启动沙箱：容器（真隔离）或受限进程（兜底），失败降级写审计
+    ⑤ 绑定上下文：session_dir / thread_id / sandbox / principal 全部进 ContextVar
+    ⑥ 执行图：astream 流式跑，逐 chunk 上报事件（工具、子 Agent、最终结果）
+    ⑦ 中断-审批循环：需要人工确认的调用先挂起，等决议后用 Command 恢复
+    ⑧ finally 清理：reset 上下文、释放沙箱、归还并发名额
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import shutil
+from pathlib import Path
+
+from langchain_core.messages import AIMessage
+
 from langgraph.checkpoint.memory import InMemorySaver
 
 # main_agent tool导入
@@ -12,151 +31,298 @@ from deepagents import create_deep_agent
 
 from agent.llm import model
 from agent.prompts import main_agent_content
+from agent.subagents.database_query_agent import database_query_agent
+from agent.subagents.knowledge_base_agent import knowledge_base_agent
+from agent.subagents.network_search_agent import network_search_agent
 
-from api.monitor import monitor
-import asyncio
-import uuid
-import shutil
-from pathlib import Path
-
-from api.context import set_session_context, reset_session_context, set_thread_context
-
-from langchain_core.messages import AIMessage
-
-main_agent = create_deep_agent(
-   model = model,
-   system_prompt=main_agent_content['system_prompt'],
-   tools= [generate_markdown,convert_md_to_pdf,read_file_content],
-   checkpointer=InMemorySaver(),
-   subagents=[
-       database_query_agent,
-       network_search_agent,
-       knowledge_base_agent
-   ]
+from api.context import (
+    reset_sandbox_context,
+    reset_security_context,
+    reset_session_context,
+    set_sandbox_context,
+    set_security_context,
+    set_session_context,
+    set_thread_context,
 )
+from api.monitor import monitor
+from concurrency.limiter import LimiterTimeout, session_limiter
+from observability.bus import event_bus
+from observability.events import EventType
+from sandbox import sandbox_manager
+from security.approval import approval_center, needs_approval
+from security.audit import audit
+from security.permissions import Role, SessionPrincipal
 
-# 执行
-"""
-  1. 执行主智能体 一定选异步，原因：对应多个客户端
-  2. 什么时候触发我们智能体的调用或者执行？？？
-  3. 客户端 -》 api/task -> fastapi 接口 -》 异步执行 -》 main_agent的运行 （异步方法）
-  4. main_agent执行stream流式处理 -》 调用工具 -》 已经埋好了点  
-                                   调用子智能体 -》 结果解析 -》 name = task -> monitor -> 发送子智能体
-                                   调用最终结果 -》 结果 -》 monitor -> 发送结果的方法
-                                   开启调用以后 -》 当前会话 -》 文件夹地址 -》 推送到前端
-"""
+logger = logging.getLogger(__name__)
+
+#: 需要人工审批的工具，交给框架的 HumanInTheLoopMiddleware 处理。
+#: 只有有副作用且不可逆的动作才需要，查询类不需要（审批疲劳会让机制失效）。
+INTERRUPT_ON = {
+    "execute_sql_query": {"allowed_decisions": ["approve", "reject"]},
+}
 
 
+def build_checkpointer():
+    """构造持久化 checkpointer（同步 SqliteSaver）。
 
-project_root_path = Path(__file__).parents[1].resolve() # 绝对 解析路径标识以及软连接
-# project_root_path = Path(__file__).parents[1].absolute() # 绝对
-# main_agent.invoke()
-# main_agent.stream()
-# main_agent.astream() [选他]
-async def run_deep_agent(task_query,session_id):
+    `InMemorySaver` 重启即丢、多 worker 各存一份，而且撑不住中断恢复：
+    审批要等用户确认，可能几十秒甚至跨进程重启，图状态必须能存下来。
     """
-    定义流式+异步执行主智能体！！
-    执行过程中，返回  会话文件化返回  调用子智能体  调用最终结果 （monitor）
+    import os
+    import sqlite3
+
+    from langgraph.checkpoint.sqlite import SqliteSaver
+
+    path = os.getenv("CHECKPOINT_DB", "data/checkpoints.sqlite")
+    db_path = Path(path)
+    if not db_path.is_absolute():
+        db_path = Path(__file__).resolve().parents[1] / db_path
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 用同步 SqliteSaver 配 check_same_thread=False：LangGraph 的异步执行会把同步
+    # checkpointer 的调用丢到线程池里跑，连接会跨线程使用，而 SQLite 默认禁止跨线程
+    # 复用连接，必须显式放开。写并发由 LangGraph 的调用顺序保证，不会产生竞态。
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    return SqliteSaver(conn)
+
+
+# 没有 SQLite 依赖时退回内存版，但明确告警（会影响中断恢复）
+try:
+    _checkpointer_cm = build_checkpointer()
+    CHECKPOINTER_PERSISTENT = True
+except Exception as exc:  # pragma: no cover
+    logger.warning("持久化 checkpointer 初始化失败（%s），退回内存版：中断恢复只能在同一进程内生效", exc)
+    _checkpointer_cm = None
+    CHECKPOINTER_PERSISTENT = False
+
+
+def _make_agent():
+    """延迟创建图，避免在模块导入期就初始化 checkpointer 与模型。"""
+    checkpointer = _checkpointer_cm
+    return create_deep_agent(
+        model=model,
+        system_prompt=main_agent_content["system_prompt"],
+        tools=[generate_markdown, convert_md_to_pdf, read_file_content],
+        checkpointer=checkpointer,
+        subagents=[
+            database_query_agent,
+            network_search_agent,
+            knowledge_base_agent,
+        ],
+        interrupt_on=INTERRUPT_ON,
+    ).with_config({"recursion_limit": int(__import__("os").getenv("AGENT_RECURSION_LIMIT", "40"))})
+
+
+# recursion_limit 通过 AGENT_RECURSION_LIMIT 配置，默认 40。框架默认是 1000，
+# 收紧是因为一次深度搜索的合理步数有限，放开到 1000 意味着跑飞的循环能烧掉 1000 步 token。
+# 实测低于 20 会切断正常的"三段检索 + 成文"流程。
+
+project_root_path = Path(__file__).parents[1].resolve()
+
+_main_agent = None
+
+
+def get_main_agent():
+    """惰性获取图实例。"""
+    global _main_agent
+    if _main_agent is None:
+        _main_agent = _make_agent()
+    return _main_agent
+
+
+# 保留模块级名字，首次访问时才构建图
+class _LazyAgent:
+    def __getattr__(self, item):
+        return getattr(get_main_agent(), item)
+
+
+main_agent = _LazyAgent()
+
+
+async def run_deep_agent(task_query, session_id, *, user_id: str = "anonymous",
+                         role: str | Role | None = None):
+    """流式异步执行主智能体，执行过程中的事件全部经 monitor 上报。
+
     task_query: 前端提问的问题
-    session_id: 每个前端会话对应的标识 （1.存储session_id ContextVars 2.session_id 给他创建对应的output输出地址）
+    session_id: 每个前端会话对应的标识
+
+    外层负责并发闸门，真正的工作在 `_run_session` 里。
     """
+    principal = SessionPrincipal.build(session_id, user_id=user_id, role=role)
+
+    # ---- ① 并发闸门：拿不到名额就在这里排队 ----
+    try:
+        async with session_limiter.acquire(session_id=session_id) as wait_ms:
+            if wait_ms > 100:
+                monitor._emit(EventType.QUEUED,
+                              f"会话排队 {wait_ms}ms 后开始执行", {"wait_ms": wait_ms})
+                event_bus.record_metric("session:queue", wait_ms)
+            await _run_session(task_query, session_id, principal)
+    except LimiterTimeout as exc:
+        monitor._emit(EventType.ERROR, str(exc), {"reason": "limiter_timeout"}, level="error")
+        audit.record(action="session_start", decision="deny", session_id=session_id,
+                     user_id=principal.user_id, reason="queue_timeout")
+
+
+async def _run_session(task_query: str, session_id: str, principal: SessionPrincipal) -> None:
+    """单个会话的完整生命周期（含沙箱与上下文清理）。"""
     print(f"当前会话的main_agent开始执行了！ 会话id:{session_id}")
-    # 准备工作 【1. session_dir（前端） 2. relative_session_dir (大模型) 3. 上传的文件拼接上传文件专属提示词】
-    # project_root_path / output / session_session_id(uuid)
-    # 当前会话存储生成文件的专属文件夹
+
+    # ---- ② 准备会话资源 ----
     session_dir = project_root_path / "output" / f"session_{session_id}"
-    # 文件夹可能没有，第一次请求要创建
     session_dir.mkdir(parents=True, exist_ok=True)
-    # \  \n \t -> /
-    session_dir_str = str(session_dir).replace("\\","/")
-    # 获取相对文件夹
-    # session_dir : project_root_path / output / session_session_id(uuid)
-    # project_root_path : project_root_path
-    # relative_session_dir_str: / output / session_session_id(uuid)
-    relative_session_dir_str = str(session_dir.relative_to(project_root_path)).replace("\\","/")
+    session_dir_str = str(session_dir).replace("\\", "/")
 
-    #处理上传文件 （updated / session_session_id）
-    updated_dir_path = project_root_path / "updated" / f"session_{session_id}"
-    updated_info_prompt = "" # 有上传文件，拼接上传文件专属解析位置的提示词
-    if updated_dir_path.exists():
-        # 有
-        files = [ f.name  for f in updated_dir_path.iterdir()  if f.is_file()]
-        # 将上传文件统一赋值到 output_dir 方便前端统一读取 session_dir
-        if files:
-            for filename in files:
-                # 将原文件 -》 复制 -》 目标文件中  （copy2 保留原文件修改时间和权限等元数据）
-                shutil.copy2(updated_dir_path / filename, session_dir / filename)
-            # 构建提示词！告诉大模型，有上传文件，你要读取上传文件！！
-            updated_info_prompt = (f"\n    [已上传文件] 已加载到工作目录:\n" +
-                             "\n".join([f"    - {f}" for f in files]) +
-                             "\n    请优先使用工具（read_file_content）读取并参考这些文件。")
+    uploads_dir = project_root_path / "updated" / f"session_{session_id}"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
 
-    # 继续准备 1. 当前会话的对应的session_id session_dir 存储到contextVars [后续工具获取，socket -> 推送消息] 2.调用monitor给前端推送session_dir信息
-    session_dir_token = set_session_context(session_dir_str)  # 存储的当前会话对应的文件夹地址
-    session_id_token = set_thread_context(session_id)  #获取当前会话的session_id对应socket
+    relative_session_dir_str = str(session_dir.relative_to(project_root_path)).replace("\\", "/")
 
-    monitor.report_session_dir(session_dir_str)  # 当前会话对应的文件夹地址推送给起前端！
+    updated_info_prompt = ""
+    files = [f.name for f in uploads_dir.iterdir() if f.is_file()] if uploads_dir.exists() else []
+    if files:
+        for filename in files:
+            # copy2 保留原文件的修改时间与权限等元数据
+            shutil.copy2(uploads_dir / filename, session_dir / filename)
+        updated_info_prompt = ("\n    [已上传文件] 已加载到工作目录:\n"
+                               + "\n".join([f"    - {f}" for f in files])
+                               + "\n    请优先使用工具（read_file_content）读取并参考这些文件。")
 
-    # 执行main_agent
-    config = {
-        "configurable":{
-            "thread_id":session_id
-        }
-    }
+    # ---- ③④⑤ 沙箱 + 上下文绑定 ----
+    tokens = {}
+    sandbox_meta = {}
+    try:
+        async with sandbox_manager.acquire(session_id, workspace=session_dir,
+                                           uploads=uploads_dir) as sandbox:
+            sandbox_meta = sandbox.meta
 
-    # 构建提示词
+            tokens["session"] = set_session_context(session_dir_str)
+            tokens["thread"] = set_thread_context(session_id)
+            tokens["sandbox"] = set_sandbox_context(sandbox)
+            tokens["security"] = set_security_context(principal)
+
+            monitor.report_session_dir(session_dir_str)
+            monitor.report_sandbox(sandbox_meta)
+            audit.record(action="session_start", decision="allow", session_id=session_id,
+                         user_id=principal.user_id, role=principal.role.value,
+                         target=str(session_dir), backend=sandbox_meta.get("backend", ""),
+                         isolated=bool(sandbox_meta.get("isolated")))
+
+            await _stream_graph(task_query, session_id, relative_session_dir_str, updated_info_prompt)
+    except Exception as exc:
+        logger.exception("会话执行失败")
+        monitor._emit(EventType.ERROR, f"执行主智能发生异常信息：{exc}",
+                      {"session_id": session_id}, level="error")
+        audit.record(action="session_run", decision="error", session_id=session_id,
+                     reason=f"{type(exc).__name__}: {exc}"[:300])
+    finally:
+        reset_security_context(tokens.get("security"))
+        reset_sandbox_context(tokens.get("sandbox"))
+        reset_session_context(tokens.get("session"), tokens.get("thread"))
+        await sandbox_manager.release(session_id)
+
+
+async def _stream_graph(task_query: str, session_id: str, workdir: str,
+                        updated_info_prompt: str) -> None:
+    """执行图并处理流式输出 + 中断审批循环。"""
+    from langgraph.types import Command
+
+    agent = get_main_agent()
+
     path_instruction = f"""
     【工作环境指令】
-    工作目录: {relative_session_dir_str}
+    工作目录: {workdir}
     {updated_info_prompt}
 
     规则：
-    1. 新生成文件必须保存到工作目录：'{relative_session_dir_str}/filename'
+    1. 新生成文件必须保存到工作目录：'{workdir}/filename'
     2. 读取已上传的文件时，请直接将文件名（例如：'开篇.txt'）作为 filename 参数传入（read_file_content）读取工具，不要带上任何目录前缀。
     3. 使用相对路径，禁止使用绝对路径
     4. 若存在上传文件，请先分析内容
     """
-    # 反馈结果
-    try:
-        # 执行
-        async for chunk in main_agent.astream({
-            "messages":[
-                {
-                    "role":"user","content":task_query+path_instruction
-                }
-            ]
-        },config=config):
-            # {"model [大模型决定调用工具 子智能体  最终结果] / tools" : {messages:[xxx...]}}
-            for node_name,state in chunk.items():
-                if not state or "messages" not in state: continue
+
+    config = {"configurable": {"thread_id": session_id}}
+    payload = {"messages": [{"role": "user", "content": task_query + path_instruction}]}
+
+    # 每次被中断就等用户决议，再用 Command(resume=...) 从断点继续
+    max_resumes = int(__import__("os").getenv("MAX_APPROVAL_ROUNDS", "5"))
+    for round_no in range(max_resumes + 1):
+        interrupted = False
+        async for chunk in agent.astream(payload, config=config):
+            # 中断信号由 LangGraph 以特殊 key 返回
+            if "__interrupt__" in chunk:
+                interrupted = True
+                await _handle_interrupt(chunk["__interrupt__"], session_id)
+                decision = _last_decision()
+                payload = Command(resume=decision)
+                break
+
+            for node_name, state in chunk.items():
+                if not state or "messages" not in state:
+                    continue
                 messages = state["messages"]
-                if messages and isinstance(messages,list):
-                    last_msg = messages[-1]
-                    if node_name == 'model':
-                        if last_msg.tool_calls:
-                            # 工具和子智能体
-                            for tool_call in last_msg.tool_calls:
-                                """
-                                  tool_call = {
-                                      name: task
-                                      args:{
-                                          subagent_type:子智能体的名字
-                                          description:子智能体的描述
-                                      }
-                                  }                                
-                                """
-                                if tool_call['name'] == 'task':
-                                    # 调用某个子智能体
-                                    monitor.report_assistant(tool_call['args']['subagent_type'],{'description':tool_call['args']['description']})
-                        elif last_msg.content:
-                            # 最终结果
-                            print(f"主智能体执行结果，最终结果：{last_msg.content[:100]}")
-                            monitor.report_task_result(last_msg.content)
+                if not messages or not isinstance(messages, list):
+                    continue
+                last_msg = messages[-1]
+                if node_name == "model":
+                    _report_model_step(last_msg)
+        if not interrupted:
+            break
+    else:
+        monitor._emit(EventType.ERROR, "审批轮次超过上限，任务终止", level="warn")
 
-    except Exception as e :
-        # 报错推送错误信息给前端
-        monitor._emit("error",f"执行主智能发生异常信息：{str(e)}")
-    finally:
-        # 释放存储的地址和session_id
-        reset_session_context(session_dir_token, session_id_token)
 
+def _report_model_step(last_msg) -> None:
+    """把一轮模型的产出翻译成事件（工具调用 / 子 Agent 委派 / 最终结果）。"""
+    if isinstance(last_msg, AIMessage) and getattr(last_msg, "tool_calls", None):
+        for tool_call in last_msg.tool_calls:
+            # tool_call 结构：
+            # {name: "task", args: {subagent_type: 子智能体名字, description: 描述}}
+            if tool_call["name"] == "task":
+                monitor.report_assistant(
+                    tool_call["args"]["subagent_type"],
+                    {"description": tool_call["args"]["description"]})
+    elif getattr(last_msg, "content", None):
+        print(f"主智能体执行结果，最终结果：{str(last_msg.content)[:100]}")
+        monitor.report_task_result(last_msg.content)
+
+
+_pending_decision: dict[str, dict] = {}
+
+
+def _last_decision() -> dict:
+    """取出最近一次审批决议（由 `_handle_interrupt` 写入）。"""
+    return _pending_decision.pop("resume", {"decisions": [{"type": "reject"}]})
+
+
+async def _handle_interrupt(interrupts, session_id: str) -> None:
+    """处理一次人工审批中断：把请求发到前端，等待决议，转成 resume 指令。"""
+    for item in interrupts if isinstance(interrupts, (list, tuple)) else [interrupts]:
+        value = getattr(item, "value", item)
+        action_requests = {}
+        if isinstance(value, dict):
+            action_requests = value.get("action_requests") or value.get("requests") or {}
+
+        if isinstance(action_requests, list) and action_requests:
+            for req in action_requests:
+                tool_name = req.get("name") or req.get("tool") or "unknown"
+                args = req.get("args") or {}
+                need, reason = needs_approval(tool_name, args)
+                if not need:
+                    reason = req.get("description") or "该操作需要人工确认后执行"
+                approval = await approval_center.request(
+                    session_id=session_id, tool_name=tool_name, args=args, reason=reason)
+                decision = "approve" if approval.status == "approved" else "reject"
+                _pending_decision["resume"] = {"decisions": [{"type": decision}]}
+                monitor._emit(EventType.APPROVAL_RESOLVED,
+                              f"{tool_name}：{approval.status}",
+                              {"approval_id": approval.approval_id, "decision": decision})
+                return
+        else:
+            # 没有结构化 action 信息时也要给用户一个决策点，默认拒绝更安全
+            approval = await approval_center.request(
+                session_id=session_id, tool_name="unknown", args={},
+                reason="检测到需要人工确认的操作")
+            decision = "approve" if approval.status == "approved" else "reject"
+            _pending_decision["resume"] = {"decisions": [{"type": decision}]}
+            return

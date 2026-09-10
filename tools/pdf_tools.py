@@ -1,5 +1,17 @@
+"""Markdown → PDF 转换工具，渲染在会话沙箱内完成。
+
+链路：md → HTML（带 CSS 与中文字体声明）→ `soffice --convert-to pdf`。
+绕一层 HTML 是因为 LibreOffice 各版本对 Markdown 的导入过滤器差异大、不可靠，
+HTML 导入才是它的稳定路径。
+
+容器根文件系统只读，LibreOffice 启动时要写用户配置目录会直接失败，所以用
+`-env:UserInstallation=file:///tmp/lo_profile` 把配置目录指到 tmpfs 上。
+
+降级路径：进程级后端跑在 Windows 宿主上且沙箱内没有 LibreOffice 时，会退回
+Word COM。这条路径只存在于本地开发，容器后端永远走 LibreOffice。
+"""
 import logging
-import sys
+import time
 from pathlib import Path
 
 try:
@@ -8,56 +20,64 @@ except ImportError:
     from typing_extensions import Annotated, Optional
 
 from langchain_core.tools import tool
+
+from api.context import get_sandbox_context, get_thread_context
 from api.monitor import monitor
-from api.context import get_session_context
-from utils.path_utils import resolve_path
-from utils.word_converter import convert_md_to_pdf_via_word
+from security.path_guard import PathSecurityError, sanitize_filename
+from security.permissions import Capability, requires
+from tools.markdown_tools import audit_event, run_async
+
+logger = logging.getLogger(__name__)
 
 
 @tool
+@requires(Capability.DOC_RENDER)
 def convert_md_to_pdf(
         md_filename: Annotated[str, "要转换的Markdown文档路径（包含.md后缀）"],
         pdf_filename: Annotated[Optional[str], "输出的PDF文件路径（可选，默认与源文件同名）"] = None
 ) -> str:
     """
-    将Markdown文档转换为PDF（基于Word引擎）
-    核心优化：路径与资源管理逻辑分离，只保留Tool层的基础调用
+    将Markdown文档转换为PDF。渲染在会话的隔离沙箱内完成（LibreOffice headless）。
     """
+    started = time.time()
     monitor.report_tool("Markdown转PDF工具")
 
+    sandbox = get_sandbox_context()
+    thread_id = get_thread_context() or ""
+
+    safe_md = sanitize_filename(Path(str(md_filename)).name)
+    if not safe_md.lower().endswith(".md"):
+        safe_md += ".md"
+
+    safe_pdf = None
+    if pdf_filename:
+        safe_pdf = sanitize_filename(Path(str(pdf_filename)).name)
+        if not safe_pdf.lower().endswith(".pdf"):
+            safe_pdf += ".pdf"
+
+    if sandbox is None:
+        audit_event("convert_md_to_pdf", "deny", thread_id, safe_md, "sandbox_unavailable")
+        return "【执行环境不可用】当前会话没有隔离沙箱，已拒绝渲染（不会降级为在宿主上调用 Office）。"
+
     try:
-        # 1. 路径预处理
-        session_dir = get_session_context()
-        md_path = Path(md_filename).with_suffix('.md')
-        md_abs_path = Path(resolve_path(str(md_path), session_dir))
+        result = run_async(sandbox.render_pdf(safe_md, safe_pdf))
+    except PathSecurityError as exc:
+        audit_event("convert_md_to_pdf", "deny", thread_id, safe_md, exc.reason)
+        return f"【路径被拒绝】{exc.reason}"
+    except Exception as exc:
+        logger.exception("沙箱渲染失败")
+        audit_event("convert_md_to_pdf", "error", thread_id, safe_md, str(exc)[:200])
+        return f"转换失败: {exc}"
 
-        # 2. 检查源文件
-        if not md_abs_path.exists():
-            return f"错误：文件不存在 {md_abs_path}"
+    duration = int((time.time() - started) * 1000)
+    audit_event("convert_md_to_pdf", "allow" if result.ok else "error",
+                thread_id, safe_md, result.error_code or "",
+                backend=result.backend, isolated=result.isolated, duration_ms=duration)
+    monitor.report_tool_end("Markdown转PDF工具", duration_ms=duration,
+                            result_preview=result.output)
 
-        # 3. 确定输出路径
-        if pdf_filename:
-            pdf_path = Path(pdf_filename).with_suffix('.pdf')
-            pdf_abs_path = Path(resolve_path(str(pdf_path), session_dir))
-        else:
-            pdf_abs_path = md_abs_path.with_suffix('.pdf')
+    if not result.ok:
+        return f"转换失败：{result.output}"
 
-        # 4. 调用核心转换逻辑
-        return convert_md_to_pdf_via_word(md_abs_path, pdf_abs_path)
-
-    except Exception as e:
-        logging.error(f"转换失败: {e}", exc_info=True)
-        return f"转换失败: {str(e)}"
-
-
-if __name__ == '__main__':
-    # 测试代码
-    # 强制覆盖当前模块中的 get_session_context
-    get_session_context = lambda: "./test_session_123"
-
-    # 创建测试文件
-    Path("./test_session_123/sub_dir").mkdir(parents=True, exist_ok=True)
-    with open("./test_session_123/sub_dir/测试文件.md", "w", encoding="utf-8") as f:
-        f.write("# 标题\n\n测试内容\n\n|A|B|\n|---|---|\n|1|2|")
-
-    print(convert_md_to_pdf.invoke({"md_filename": "sub_dir/测试文件.md"}))
+    engine = "LibreOffice（容器内）" if result.isolated else "Word COM（本地降级路径）"
+    return f"{result.output}  —— 渲染引擎：{engine}"

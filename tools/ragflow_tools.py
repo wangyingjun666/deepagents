@@ -1,13 +1,33 @@
 #  get_assistant_list 获取聊天助手和知识库信息
 #  create_ask_delete  创建提问和删除会话获取rag查询结果
+#
+#  权限：两个工具都要求 Capability.KB_QUERY，和 db_tools 的 DB_QUERY、
+#        markdown_tools 的 FS_WRITE_SESSION 挂在同一张能力路由表上。
+#        调用边界集中定义，避免各工具口径不一致。
+import logging
+
 from langchain_core.tools import tool
 
+from api.context import get_thread_context
 from api.monitor import monitor
 from rawflow.rag_config import _load_ragflow_env
+from security.audit import audit
+from security.permissions import Capability, requires
 
-# 创建一个ragflow的客户端
-# 注意：改为惰性创建（懒加载）——没有配置 RAGFlow 服务器时不让程序启动崩溃，
-#       而是等真正调用 RAGFlow 工具时返回友好提示。
+logger = logging.getLogger(__name__)
+
+
+def audit_event(action: str, decision: str, target: str, reason: str = "", **extra) -> None:
+    """知识库访问留痕：问了哪个助手、什么问题、成没成。成功和失败都记。"""
+    try:
+        audit.record(action=action, decision=decision,
+                     session_id=get_thread_context() or "", target=target,
+                     reason=reason, **extra)
+    except Exception:
+        logger.exception("审计写入失败（已忽略）")
+
+# ragflow 客户端。惰性创建：没配置 RAGFlow 服务器时不至于让程序启动就崩，
+# 等真正调用工具再返回提示。
 _ragflow_client = None
 
 
@@ -33,6 +53,7 @@ def _get_ragflow_client():
 
 # 1. 查询现在知识库中有哪些聊天助手和对应知识库的信息 （方便我们知道rag可以给我们提供哪些数据）
 @tool
+@requires(Capability.KB_QUERY)
 def get_assistant_list() -> str:
     """
     调用此工具，可以查询ragflow服务器中有哪些助手和助手关联的知识库信息！
@@ -71,12 +92,15 @@ def get_assistant_list() -> str:
             # 拼接下当前助手的信息 + 知识库信息
             # 法律资源小助手  xxxxxx  关联知识库：xx、xxx、xxx
             count_chat_info += f"助手名称:{chat.name};功能介绍：{chat.description}; 关联的知识库：{'、'.join(dataset_names)} \n"
+        audit_event("kb_list_assistants", "allow", "-", f"{len(chat_list)} 个助手")
         return count_chat_info
     except Exception as e:
+        audit_event("kb_list_assistants", "error", "-", str(e)[:200])
         return f"查询助手信息异常，无可用助手,异常信息:{str(e)}"
 
 # 2. 对某个助手进行提问（创建会话 -》 提问 -》 删除会话）
 @tool
+@requires(Capability.KB_QUERY)
 def create_ask_delete(chat_name,question)->str:
     """
     想某个助手，创建单次会话进行提问，提问完毕以后会关闭会话！
@@ -114,8 +138,11 @@ def create_ask_delete(chat_name,question)->str:
         # chat -> 关闭 -》  session
         use_chat.delete_sessions(ids=[session.id])
         # 6. 返回结果
+        audit_event("kb_ask", "allow", chat_name, "", question=question[:200],
+                    answer_chars=len(result or ""))
         return result
     except Exception as e:
+        audit_event("kb_ask", "error", chat_name, str(e)[:200], question=question[:200])
         return f"提问失败，错误原因：{str(e)}"
 
 # if __name__ == '__main__':

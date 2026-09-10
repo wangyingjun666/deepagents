@@ -1,43 +1,40 @@
-from contextvars import ContextVar
+"""
+会话上下文：把"当前是谁在执行"绑定到协程上。
+
+四个变量：
+* `session_dir` —— 当前会话工作目录（宿主视角，仅用于展示与只读映射）
+* `thread_id`   —— 当前会话标识，用于把事件路由到对应的 WebSocket
+* `sandbox`     —— 当前会话的隔离执行环境句柄（文件读写与 PDF 渲染都走它）
+* `principal`   —— 当前会话的安全主体（用户 / 角色 / 能力集合），见 security/permissions.py
+"""
+from contextvars import ContextVar, Token
 from typing import Optional
 
 # =================================================================================================
-# 核心知识点: ContextVars (上下文变量)
+# ContextVar：协程级隔离
 # =================================================================================================
-# Q: 为什么我们需要 ContextVar？为什么不能直接用全局变量？
-#
-# A: 在开发异步 Web 服务 (如 FastAPI) 时，系统是 "并发" 处理多个用户请求的。
-#    但在 Python 的 asyncio 机制下，这些并发请求通常运行在 *同一个线程 (Thread)* 中。
-#
-#    1. 如果使用全局变量 (Global Variable):
-#       当 User A 的请求正在处理时，User B 的请求进来了。如果修改了全局变量，User A 的数据
-#       就会被 User B 覆盖，导致严重的 "串台" 事故（例如 User A 的文件存到了 User B 的目录）。
-#
-#    2. 如果使用 threading.local:
-#       它是基于线程隔离的。因为 asyncio 所有协程都在同一个线程跑，所以 threading.local
-#       在异步场景下失效，无法隔离不同用户的请求。
-#
-#    3. ContextVar 的解决方案:
-#       ContextVar 是 Python 3.7+ 专门为异步编程设计的 "协程级局部变量"。
-#       它能确保变量在每一个 asyncio Task (即每个用户请求) 中是 *独立隔离* 的。
-#       无论代码调用多深，只要是在同一个请求链路（Context）中，get() 到的都是属于当前请求的数据。
+# asyncio 里并发请求跑在同一个线程上，所以：
+#   - 全局变量会被并发请求互相覆盖（A 的文件写进 B 的目录）；
+#   - threading.local 按线程隔离，同一线程内失效；
+#   - ContextVar 按 asyncio Task 隔离，同一个请求链路（含任意深度的调用）里
+#     get() 拿到的都是本请求的值。
+# 隔离单元是协程，不是线程也不是进程。
 # =================================================================================================
 
 
-# 定义 ContextVar 上下文变量
-# -------------------------------------------------------------------------
-# 这里的变量名只是一个标识符 (Identifier)，真正的值是存储在当前的 Context 环境中的。
+# ContextVar 的变量名只是标识符，值存在当前 Context 环境里。
 
-# - 作用 ：用来记录 “当前是谁在执行任务” 。
-# - 场景 ：当 Agent 打印日志或者通过 WebSocket 给前端发消息时，它需要知道：“我现在是正在服务张三，还是李四？” 这样消息才不会发错人。
+# 当前会话的文件该落在哪。工具函数在任意深度都能直接取到，不必层层传参。
 _session_dir_ctx: ContextVar[Optional[str]] = ContextVar("session_dir", default=None)
 
-# - 作用 ：用来记录 “当前是谁在执行任务” 。
-# - 场景 ：当 Agent 打印日志或者通过 WebSocket 给前端发消息时，它需要知道：“我现在是正在服务张三，还是李四？” 这样消息才不会发错人。
+# 当前是谁在执行任务。Agent 打日志或经 WebSocket 发消息时据此路由到正确的会话。
 _thread_id_ctx: ContextVar[Optional[str]] = ContextVar("thread_id", default=None)
 
+# 当前会话的隔离执行环境。工具不直接写宿主磁盘，而是把操作交给沙箱执行。
+_sandbox_ctx: ContextVar[Optional[object]] = ContextVar("sandbox", default=None)
 
-def set_session_context(path: str):
+
+def set_session_context(path: str) -> Token:
     """
     设置当前请求链路的会话目录。
     通常在 Agent 开始执行任务前调用。
@@ -56,7 +53,7 @@ def get_session_context() -> Optional[str]:
     return _session_dir_ctx.get()
 
 
-def set_thread_context(thread_id: str):
+def set_thread_context(thread_id: str) -> Token:
     """
     设置当前请求链路的 Thread ID。
     """
@@ -72,9 +69,66 @@ def get_thread_context() -> Optional[str]:
 
 def reset_session_context(session_token, thread_token=None):
     """
-    清理/重置上下文。
-    通常在请求处理结束 (finally 块) 中调用，防止内存泄漏或污染后续请求。
+    清理/重置上下文，通常在请求处理结束 (finally 块) 中调用。
+
+    用 token 回滚而不是 `set(None)`：token 是栈式的，嵌套场景下不会破坏外层值；
+    `set(None)` 是无条件覆盖，会把外层也抹掉。
     """
-    _session_dir_ctx.reset(session_token)
-    if thread_token:
+    if session_token is not None:
+        _session_dir_ctx.reset(session_token)
+    if thread_token is not None:
         _thread_id_ctx.reset(thread_token)
+
+
+# 沙箱上下文：副作用只在隔离环境里发生
+def set_sandbox_context(sandbox):
+    return _sandbox_ctx.set(sandbox)
+
+
+def get_sandbox_context():
+    return _sandbox_ctx.get()
+
+
+def reset_sandbox_context(token) -> None:
+    if token is not None:
+        _sandbox_ctx.reset(token)
+
+
+def require_sandbox():
+    """取当前会话沙箱。取不到直接抛异常，不降级成直接写宿主磁盘。
+
+    隔离环境不可用时正确的行为是失败，而不是绕过隔离。
+    """
+    sb = _sandbox_ctx.get()
+    if sb is None:
+        raise RuntimeError("当前上下文没有沙箱，拒绝执行文件操作（不会降级为直接访问宿主）")
+    return sb
+
+
+# 安全主体：和沙箱一样按协程隔离
+def set_security_context(principal):
+    from security.permissions import set_principal
+    return set_principal(principal)
+
+
+def get_security_context():
+    from security.permissions import current_principal
+    return current_principal()
+
+
+def reset_security_context(token) -> None:
+    from security.permissions import reset_principal
+    reset_principal(token)
+
+
+def describe() -> dict:
+    """当前协程的上下文快照（调试和事件 payload 用）。"""
+    principal = get_security_context()
+    sb = _sandbox_ctx.get()
+    return {
+        "session_dir": _session_dir_ctx.get(),
+        "thread_id": _thread_id_ctx.get(),
+        "sandbox": getattr(sb, "name", None),
+        "sandbox_isolated": bool(getattr(sb, "meta", {}).get("isolated")),
+        "principal": principal.to_dict() if principal else None,
+    }

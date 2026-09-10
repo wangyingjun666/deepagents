@@ -10,16 +10,25 @@ env/
 .env
 .env.local
 .env.*.local
+.env.bak*
+*.pem
 
 # ---------- 前端（Node） ----------
 ui/node_modules/
 ui/dist/
 ui/*.tsbuildinfo
 
-# ---------- 运行时自动生成的目录（首次运行自动创建） ----------
+# ---------- 运行时自动生成的目录 ----------
 output/
 updated/
 log/
+logs/
+data/
+*.sqlite
+*.jsonl
+
+# ---------- 构建/文档产物 ----------
+*.render.html
 
 # ---------- IDE / 系统 ----------
 .idea/
