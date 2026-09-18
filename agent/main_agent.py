@@ -37,6 +37,11 @@ from agent.memory import (
     build_memory_store,
     ensure_memory_seed,
 )
+from agent.reflection import (
+    build_followup_message,
+    load_reflection_config,
+    reflect_on_answer,
+)
 from agent.prompts import main_agent_content
 from agent.subagents.database_query_agent import database_query_agent
 from agent.subagents.knowledge_base_agent import knowledge_base_agent
@@ -290,11 +295,45 @@ async def _stream_graph(task_query: str, session_id: str, workdir: str,
         except Exception as exc:  # pragma: no cover
             logger.warning("长期记忆种子写入失败（%s），本次跳过，不影响本次执行", exc)
 
-    # 每次被中断就等用户决议，再用 Command(resume=...) 从断点继续
+    answer = await _run_graph_once(agent, payload, config, run_context, session_id)
+
+    # 反思重规划：核对原始任务里的要求是否都覆盖到了，有缺口就带着缺口再跑一轮。
+    # 轮数有上限，超了按当前结果交付；反思自身出错一律按「充分」处理。
+    reflect_cfg = load_reflection_config()
+    if reflect_cfg.enabled and reflect_cfg.max_rounds > 0:
+        for round_no in range(1, reflect_cfg.max_rounds + 1):
+            result = reflect_on_answer(task_query, answer, config=reflect_cfg)
+            monitor._emit(
+                EventType.REFLECTION,
+                f"第 {round_no} 轮反思：{result.reason}",
+                {"round": round_no, "sufficient": result.sufficient,
+                 "missing": result.missing, "next_query": result.next_query})
+            if not result.needs_another_round():
+                break
+
+            logger.info("反思判定存在缺口，追加第 %s 轮检索", round_no)
+            followup = build_followup_message(result, round_no)
+            payload = {"messages": [{"role": "user", "content": followup}]}
+            # 这一轮拿不到新回答时保留上一轮的结果，不让反思把已有的产出弄丢
+            answer = await _run_graph_once(agent, payload, config, run_context,
+                                           session_id) or answer
+        else:
+            monitor._emit(EventType.REFLECTION,
+                          f"反思轮次已达上限（{reflect_cfg.max_rounds}），按当前结果交付",
+                          {"exhausted": True}, level="warn")
+
+
+async def _run_graph_once(agent, payload, config, run_context, session_id: str) -> str:
+    """跑一遍图（含中断-审批循环），返回这一轮产出的最终回答。
+
+    payload 为 Command 时表示从断点恢复，属于同一次调用，context 要与首次保持一致。
+    """
+    from langgraph.types import Command
+
+    latest_answer = ""
     max_resumes = int(__import__("os").getenv("MAX_APPROVAL_ROUNDS", "5"))
     for round_no in range(max_resumes + 1):
         interrupted = False
-        # 恢复执行（Command）属于同一次调用，context 要和首次调用保持一致
         async for chunk in agent.astream(payload, config=config, context=run_context):
             # 中断信号由 LangGraph 以特殊 key 返回
             if "__interrupt__" in chunk:
@@ -312,15 +351,19 @@ async def _stream_graph(task_query: str, session_id: str, workdir: str,
                     continue
                 last_msg = messages[-1]
                 if node_name == "model":
-                    _report_model_step(last_msg)
+                    produced = _report_model_step(last_msg)
+                    if produced:
+                        latest_answer = produced
         if not interrupted:
             break
     else:
         monitor._emit(EventType.ERROR, "审批轮次超过上限，任务终止", level="warn")
 
+    return latest_answer
 
-def _report_model_step(last_msg) -> None:
-    """把一轮模型的产出翻译成事件（工具调用 / 子 Agent 委派 / 最终结果）。"""
+
+def _report_model_step(last_msg) -> str:
+    """把一轮模型的产出翻译成事件，返回最终回答文本（纯工具调用轮返回空串）。"""
     if isinstance(last_msg, AIMessage) and getattr(last_msg, "tool_calls", None):
         for tool_call in last_msg.tool_calls:
             # tool_call 结构：
@@ -329,9 +372,14 @@ def _report_model_step(last_msg) -> None:
                 monitor.report_assistant(
                     tool_call["args"]["subagent_type"],
                     {"description": tool_call["args"]["description"]})
-    elif getattr(last_msg, "content", None):
-        print(f"主智能体执行结果，最终结果：{str(last_msg.content)[:100]}")
-        monitor.report_task_result(last_msg.content)
+        return ""
+
+    content = getattr(last_msg, "content", None)
+    if content:
+        print(f"主智能体执行结果，最终结果：{str(content)[:100]}")
+        monitor.report_task_result(content)
+        return str(content)
+    return ""
 
 
 _pending_decision: dict[str, dict] = {}

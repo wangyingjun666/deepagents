@@ -51,6 +51,9 @@ class EventType:
     RETRY = "retry"
     CIRCUIT_OPEN = "circuit_open"
 
+    # --- 反思重规划 ---
+    REFLECTION = "reflection"
+
 
 ALL_EVENT_TYPES = frozenset(
     v for k, v in vars(EventType).items() if not k.startswith("_") and isinstance(v, str))
