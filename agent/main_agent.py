@@ -30,6 +30,13 @@ from tools.upload_file_read_tool import read_file_content
 from deepagents import create_deep_agent
 
 from agent.llm import model
+from agent.memory import (
+    MEMORY_SOURCES,
+    MemoryContext,
+    build_backend,
+    build_memory_store,
+    ensure_memory_seed,
+)
 from agent.prompts import main_agent_content
 from agent.subagents.database_query_agent import database_query_agent
 from agent.subagents.knowledge_base_agent import knowledge_base_agent
@@ -96,9 +103,33 @@ except Exception as exc:  # pragma: no cover
     CHECKPOINTER_PERSISTENT = False
 
 
+# 长期记忆库：起不来就降级成「不启用记忆」，但不能拖垮整个服务
+try:
+    _memory_store = build_memory_store()
+    ensure_memory_seed(_memory_store)
+    MEMORY_ENABLED = True
+except Exception as exc:  # pragma: no cover
+    logger.warning("长期记忆初始化失败（%s），本次启动不启用跨会话记忆", exc)
+    _memory_store = None
+    MEMORY_ENABLED = False
+
+
 def _make_agent():
     """延迟创建图，避免在模块导入期就初始化 checkpointer 与模型。"""
     checkpointer = _checkpointer_cm
+
+    # 长期记忆三件套缺一不可：
+    #   store   —— 持久化底座（LangGraph BaseStore）
+    #   backend —— 把 /memories/ 前缀路由到 store，其余路径行为不变
+    #   memory  —— 告诉 MemoryMiddleware 该把哪个文件读进系统提示词
+    memory_kwargs = {}
+    if _memory_store is not None:
+        memory_kwargs = {
+            "store": _memory_store,
+            "backend": build_backend,
+            "memory": MEMORY_SOURCES,
+        }
+
     return create_deep_agent(
         model=model,
         system_prompt=main_agent_content["system_prompt"],
@@ -110,6 +141,8 @@ def _make_agent():
             knowledge_base_agent,
         ],
         interrupt_on=INTERRUPT_ON,
+        context_schema=MemoryContext,
+        **memory_kwargs,
     ).with_config({"recursion_limit": int(__import__("os").getenv("AGENT_RECURSION_LIMIT", "40"))})
 
 
@@ -208,7 +241,8 @@ async def _run_session(task_query: str, session_id: str, principal: SessionPrinc
                          target=str(session_dir), backend=sandbox_meta.get("backend", ""),
                          isolated=bool(sandbox_meta.get("isolated")))
 
-            await _stream_graph(task_query, session_id, relative_session_dir_str, updated_info_prompt)
+            await _stream_graph(task_query, session_id, relative_session_dir_str,
+                                updated_info_prompt, principal.user_id)
     except Exception as exc:
         logger.exception("会话执行失败")
         monitor._emit(EventType.ERROR, f"执行主智能发生异常信息：{exc}",
@@ -223,7 +257,7 @@ async def _run_session(task_query: str, session_id: str, principal: SessionPrinc
 
 
 async def _stream_graph(task_query: str, session_id: str, workdir: str,
-                        updated_info_prompt: str) -> None:
+                        updated_info_prompt: str, user_id: str = "anonymous") -> None:
     """执行图并处理流式输出 + 中断审批循环。"""
     from langgraph.types import Command
 
@@ -244,11 +278,24 @@ async def _stream_graph(task_query: str, session_id: str, workdir: str,
     config = {"configurable": {"thread_id": session_id}}
     payload = {"messages": [{"role": "user", "content": task_query + path_instruction}]}
 
+    # 长期记忆的命名空间靠 context 里的 user_id 决定，不能走 ContextVar：
+    # 中间件钩子可能在线程池里执行，ContextVar 传不过去，而 context 是本次调用显式带的。
+    run_context = MemoryContext(user_id=user_id)
+
+    # 新用户第一次进来时命名空间是空的，MemoryMiddleware 对不存在的文件是静默跳过的，
+    # 于是「功能装好了但什么都没发生」。这里补一次种子，让记忆从第一轮就可读。
+    if MEMORY_ENABLED:
+        try:
+            ensure_memory_seed(_memory_store, user_id=user_id)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("长期记忆种子写入失败（%s），本次跳过，不影响本次执行", exc)
+
     # 每次被中断就等用户决议，再用 Command(resume=...) 从断点继续
     max_resumes = int(__import__("os").getenv("MAX_APPROVAL_ROUNDS", "5"))
     for round_no in range(max_resumes + 1):
         interrupted = False
-        async for chunk in agent.astream(payload, config=config):
+        # 恢复执行（Command）属于同一次调用，context 要和首次调用保持一致
+        async for chunk in agent.astream(payload, config=config, context=run_context):
             # 中断信号由 LangGraph 以特殊 key 返回
             if "__interrupt__" in chunk:
                 interrupted = True
