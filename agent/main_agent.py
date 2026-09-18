@@ -60,6 +60,7 @@ from api.monitor import monitor
 from concurrency.limiter import LimiterTimeout, session_limiter
 from observability.bus import event_bus
 from observability.events import EventType
+from observability.trajectory import TrajectoryRecorder, trajectory_enabled
 from sandbox import sandbox_manager
 from security.approval import approval_center, needs_approval
 from security.audit import audit
@@ -283,6 +284,15 @@ async def _stream_graph(task_query: str, session_id: str, workdir: str,
     config = {"configurable": {"thread_id": session_id}}
     payload = {"messages": [{"role": "user", "content": task_query + path_instruction}]}
 
+    # 轨迹记录：把模型收到的完整输入和输出落盘，供事后回放与分叉。
+    # 挂不上就跳过，不影响本次执行。
+    if trajectory_enabled():
+        try:
+            config["callbacks"] = [TrajectoryRecorder(
+                session_id, meta={"user_id": user_id, "task": task_query[:200]})]
+        except Exception as exc:  # pragma: no cover
+            logger.warning("轨迹记录器创建失败（%s），本次不记录轨迹", exc)
+
     # 长期记忆的命名空间靠 context 里的 user_id 决定，不能走 ContextVar：
     # 中间件钩子可能在线程池里执行，ContextVar 传不过去，而 context 是本次调用显式带的。
     run_context = MemoryContext(user_id=user_id)
@@ -302,7 +312,8 @@ async def _stream_graph(task_query: str, session_id: str, workdir: str,
     reflect_cfg = load_reflection_config()
     if reflect_cfg.enabled and reflect_cfg.max_rounds > 0:
         for round_no in range(1, reflect_cfg.max_rounds + 1):
-            result = reflect_on_answer(task_query, answer, config=reflect_cfg)
+            result = reflect_on_answer(task_query, answer, config=reflect_cfg,
+                                       callbacks=config.get("callbacks"))
             monitor._emit(
                 EventType.REFLECTION,
                 f"第 {round_no} 轮反思：{result.reason}",

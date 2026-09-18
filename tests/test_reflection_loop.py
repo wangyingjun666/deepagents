@@ -22,6 +22,7 @@ import contextlib
 import io
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -51,7 +52,9 @@ class Harness:
         self.reflections = list(reflections)
         self.max_rounds = max_rounds
         self.rounds = 0
+        self.configs = []
         self.reflect_inputs = []
+        self.reflect_callbacks = []
         self.events = []
         self._saved = {}
 
@@ -68,12 +71,14 @@ class Harness:
 
         async def fake_run(agent, payload, config, run_context, session_id):
             self.rounds += 1
+            self.configs.append(config)
             return self.answers.pop(0) if self.answers else ""
 
         ma._run_graph_once = fake_run
 
-        def fake_reflect(task, answer, *, llm_call=None, config=None):
+        def fake_reflect(task, answer, *, llm_call=None, config=None, callbacks=None):
             self.reflect_inputs.append((task, answer))
+            self.reflect_callbacks.append(callbacks)
             if self.reflections:
                 return self.reflections.pop(0)
             return ReflectionResult(sufficient=True, reason="默认充分")
@@ -162,6 +167,22 @@ def test_bounded_by_max_rounds():
     check(len(exhausted) == 1, "发出了「已达上限」的告警事件")
 
 
+def test_trajectory_recorder_attached():
+    print("\n[7] 轨迹记录器被挂进 agent 调用")
+    os.environ["TRAJECTORY_ENABLED"] = "1"
+    os.environ["TRAJECTORY_DIR"] = os.path.join(tempfile.gettempdir(), "traj_loop_test")
+    with Harness(answers=["某结果"], reflections=[sufficient()]) as h:
+        run_session()
+    callbacks = (h.configs[0] or {}).get("callbacks") or []
+    check(len(callbacks) == 1, f"config 里有一个回调（实际 {len(callbacks)}）")
+    check(type(callbacks[0]).__name__ == "TrajectoryRecorder", "回调类型正确")
+    check(getattr(callbacks[0], "session_id", None) == "sess-1", "回调绑定了正确的会话")
+    check("thread_id" in (h.configs[0].get("configurable") or {}), "原有 configurable 未被破坏")
+    passed = h.reflect_callbacks[0]
+    check(passed and len(passed) == 1 and type(passed[0]).__name__ == "TrajectoryRecorder",
+          "反思那次模型调用也被纳入轨迹")
+
+
 def test_reflect_sees_original_task():
     print("\n[6] 反思拿到的是原始任务")
     with Harness(answers=["第一版"], reflections=[sufficient()]) as h:
@@ -176,6 +197,7 @@ def main():
     test_reflect_error_fails_open()
     test_empty_followup_keeps_previous()
     test_bounded_by_max_rounds()
+    test_trajectory_recorder_attached()
     test_reflect_sees_original_task()
 
     print(f"\n=== 接线测试结果：{len(PASS)} 通过 / {len(FAIL)} 失败 ===")

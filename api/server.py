@@ -9,6 +9,9 @@ FastAPI 服务层：任务入口、文件接口、WebSocket 实时通道、审�
 * `GET  /api/download`              —— 下载 output 目录内的文件
 * `GET  /api/trace/{session_id}`    —— 拉取会话的结构化事件（支持增量）
 * `GET  /api/trace/{session_id}/spans` —— 事件还原成调用树
+* `GET  /api/trajectory`            —— 已落盘的轨迹列表
+* `GET  /api/trajectory/{sid}`      —— 会话轨迹（模型看到什么、返回什么）
+* `POST /api/trajectory/{sid}/fork` —— 轨迹分叉，用于换参数重跑并对比
 * `GET  /api/metrics`               —— P50/P95、失败率、限流与熔断状态
 * `GET  /api/audit`                 —— 审计日志查询（哈希链）
 * `GET  /api/system`                —— 沙箱后端、隔离自检、安全策略总览
@@ -50,6 +53,7 @@ from concurrency.retry import breakers_snapshot
 from observability.bus import event_bus
 from observability.metrics import metrics
 from observability.store import event_store
+from observability.trajectory import TrajectoryStore
 from sandbox import sandbox_manager
 from security.approval import approval_center
 from security.audit import audit
@@ -256,6 +260,38 @@ async def get_spans(session_id: str):
     # 只做一层聚合，够用于上面的问题
     return {"session_id": session_id, "total": len(events),
             "roots": len(roots), "events": events}
+
+
+@app.get("/api/trajectory")
+async def list_trajectories():
+    """列出已经落盘的轨迹会话。"""
+    sessions = TrajectoryStore().sessions()
+    return {"count": len(sessions), "sessions": sessions}
+
+
+@app.get("/api/trajectory/{session_id}")
+async def get_trajectory(session_id: str, with_payload: bool = Query(False)):
+    """拉取会话的完整轨迹。
+
+    with_payload=true 时连模型收到的完整输入一起返回，用于回答
+    "它当时到底看到了什么"；默认只给时间线骨架，体积小得多。
+    """
+    store = TrajectoryStore()
+    if not store.exists(session_id):
+        raise HTTPException(status_code=404, detail=f"没有这条轨迹：{session_id}")
+    return {"session_id": session_id,
+            "summary": store.summarize(session_id),
+            "frames": store.frames(session_id, with_payload=with_payload)}
+
+
+@app.post("/api/trajectory/{session_id}/fork")
+async def fork_trajectory(session_id: str, upto_step: Optional[str] = Body(None, embed=True)):
+    """把一条轨迹的前缀分叉成新轨迹，在分叉点之后换参数重跑并对比。"""
+    try:
+        new_id = TrajectoryStore().fork(session_id, upto_step=upto_step)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {"session_id": session_id, "forked": new_id, "upto_step": upto_step}
 
 
 @app.get("/api/metrics")

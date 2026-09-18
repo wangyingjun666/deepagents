@@ -157,11 +157,18 @@ def parse_reflection_response(raw: str) -> Optional[dict]:
     }
 
 
-def _default_llm_call(prompt: str) -> str:
-    """默认的反思调用：走项目统一的大模型入口。"""
+def _default_llm_call(prompt: str, callbacks: Optional[List[Any]] = None) -> str:
+    """默认的反思调用：走项目统一的大模型入口。
+
+    callbacks 透传进来是为了让反思这几次调用也进轨迹 —— 否则排障时会看到
+    "两次模型调用之间凭空多了一轮"，而那一轮恰恰是判断要不要重跑的。
+    """
     from agent.llm import model
 
-    response = model.invoke(prompt)
+    if callbacks:
+        response = model.invoke(prompt, config={"callbacks": list(callbacks)})
+    else:
+        response = model.invoke(prompt)
     return getattr(response, "content", "") or ""
 
 
@@ -175,6 +182,7 @@ def reflect_on_answer(
         *,
         llm_call: Optional[Callable[[str], str]] = None,
         config: Optional[ReflectionConfig] = None,
+        callbacks: Optional[List[Any]] = None,
 ) -> ReflectionResult:
     """判断当前回答是否充分回答了原始任务。
 
@@ -182,6 +190,7 @@ def reflect_on_answer(
     :param answer: 本轮产出的最终回答
     :param llm_call: 反思生成函数，签名 (prompt) -> str；默认走项目大模型
     :param config: 配置，默认从环境变量读
+    :param callbacks: 透传给模型调用的回调（通常是轨迹记录器）；注入了 llm_call 时忽略
     :return: ReflectionResult；任何失败都返回"充分"，不会抛异常
     """
     cfg = config or load_reflection_config()
@@ -196,12 +205,12 @@ def reflect_on_answer(
         return result
 
     try:
-        llm_call = llm_call or _default_llm_call
         prompt = reflection_content["user_prompt"].format(
             task=task,
             answer=(answer or "").strip()[:MAX_ANSWER_CHARS],
         )
-        raw = llm_call(prompt)
+        # 自己注入的 llm_call 由调用方负责，默认路径才需要把回调带下去
+        raw = llm_call(prompt) if llm_call else _default_llm_call(prompt, callbacks)
         parsed = parse_reflection_response(raw)
 
         if parsed is None:
@@ -239,7 +248,7 @@ def build_followup_message(result: ReflectionResult, round_no: int) -> str:
     """把反思结论拼成下一轮的追加指令。
 
     措辞上刻意要求"只补缺口，不要重写已完成的报告"——否则模型容易把
-    上一版的报告推倒重来，既浪费 token，也会把已经核对过的内容改坏。
+    上一轮给出的报告推倒重来，既浪费 token，也会把已经核对过的内容改坏。
     """
     lines = [
         f"【补充检索指令 · 第 {round_no} 轮】",
