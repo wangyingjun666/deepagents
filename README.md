@@ -1,8 +1,9 @@
 # DeepAgents 深度搜索系统
 
 基于 DeepAgents 框架的多智能体深度搜索示例。1 个主智能体调度 3 个子智能体
-（联网搜索 / MySQL 查询 / RAGFlow 知识库），结果生成 Markdown 与 PDF，
-Vue3 前端通过 WebSocket 实时显示执行进度。
+（联网搜索 / MySQL 查询 / 文档解析），三路对应三个正交信息源域
+（公网信息 / 内部结构化数据 / 用户上传文档），互相独立、可并行委派；
+结果生成 Markdown 与 PDF，Vue3 前端通过 WebSocket 实时显示执行进度。
 
 在基础的多智能体编排之外，项目重点做了三件事：
 
@@ -20,7 +21,7 @@ Vue3 前端通过 WebSocket 实时显示执行进度。
 
 - Python 3.10+、Node.js 18+、MySQL
 - 一个 OpenAI 兼容的大模型 Key（示例用 DeepSeek）
-- Tavily Key（可选：联网搜索）；RAGFlow（可选：知识库）
+- Tavily Key（可选：联网搜索）
 - Docker（可选但推荐：不装则沙箱走进程级兜底）
 
 ## 快速开始
@@ -64,14 +65,16 @@ npm run dev                   # 页面 http://localhost:5173
 查询 company_db 数据库里阿莫西林的总库存，生成一个markdown报告
 ```
 
-缺 Tavily / RAGFlow Key 不影响启动，对应子智能体会提示不可用。
+缺 Tavily Key 不影响启动，网络搜索子智能体会提示不可用。
+文档解析子智能体不依赖任何外部服务：文本类文件直接读，
+.docx/.pdf/.xlsx 在沙箱内解析（容器后端需重建镜像：`python sandbox/build_image.py`）。
 
 ## 目录结构
 
 ```
 agent/          主智能体、子智能体、LLM 客户端
 api/            FastAPI 服务、会话上下文（ContextVar）、事件总线出口
-tools/          工具实现（数据库 / Markdown / PDF / 联网 / 知识库 / 上传件读取）
+tools/          工具实现（数据库 / Markdown / PDF / 联网 / 文件读取与文档解析）
 security/       路径守卫、SQL 守卫、能力路由、人工审批、哈希链审计
 sandbox/        沙箱后端（Docker / 进程级可插拔）、生命周期管理、容器内执行器
 observability/  事件模型、总线、落盘、指标
@@ -112,6 +115,7 @@ tests/          安全沙箱单元测试 + 端到端集成测试
 ```bash
 python tests/test_security_and_sandbox.py   # 42 项，不需要 Docker / 数据库
 python tests/test_integration.py            # 23 项，无 Docker 时自动走进程级后端
+python tests/test_document_parse.py         # 文档解析子 Agent：沙箱提取 + 工具路由 + 挂载接线
 ```
 
 ## 说明
