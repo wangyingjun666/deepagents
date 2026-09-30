@@ -25,10 +25,7 @@ prompt_yaml_content = load_yaml(yaml_file_path)
 
 # main_agent_content
 main_agent_content = prompt_yaml_content["main_agent"]
-print(main_agent_content)
 # sub_agents_content
 sub_agents_content = prompt_yaml_content["sub_agents"]
-
-print(sub_agents_content)
 # reflection_content
 reflection_content = prompt_yaml_content["reflection"]

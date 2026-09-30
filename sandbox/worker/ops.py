@@ -74,6 +74,12 @@ def guard_within_sandbox(rel_path: str, *, allow_uploads: bool = False) -> str:
 
 MAX_WRITE_BYTES = 8 * 1024 * 1024
 
+#: 文档解析支持的格式（extract_document 操作），文本类格式请走 read_file
+DOCUMENT_SUFFIXES = {".docx", ".pdf", ".xlsx", ".xls"}
+
+#: 单次文档提取的字符上限，防止超大文档撑爆模型上下文
+MAX_EXTRACT_CHARS = int(os.getenv("SANDBOX_EXTRACT_MAX_CHARS", "200000"))
+
 #: 沙箱内允许写入的后缀白名单，与宿主守卫的默认值一致（纵深防御）。
 WRITE_SUFFIXES = {
     s.strip().lower()
@@ -176,6 +182,98 @@ def op_read_file(params: dict) -> dict:
         return _ok(target.read_text(encoding="utf-8", errors="replace"))
     except OSError as exc:
         return _err(f"读取失败：{exc}", "read_failed")
+
+
+# --------------------------------------------------------------------------
+# 文档提取（docx / pdf / xlsx）：解析永远发生在沙箱内，不进宿主进程。
+# 解析库按需惰性导入：容器镜像或宿主缺库时返回结构化 missing_dependency，
+# 调用方（宿主工具层）能把这句错误直接喂回模型，不打断 Agent 循环。
+# --------------------------------------------------------------------------
+def _extract_docx(path: Path) -> str:
+    try:
+        from docx import Document
+    except ImportError:
+        raise OpError("沙箱缺少 python-docx 库（容器后端需重建镜像：python sandbox/build_image.py）",
+                      "missing_dependency")
+    doc = Document(str(path))
+    lines = [p.text for p in doc.paragraphs if p.text.strip()]
+    for table in doc.tables:
+        for row in table.rows:
+            lines.append(" | ".join(cell.text.strip() for cell in row.cells))
+    return "\n".join(lines)
+
+
+def _extract_pdf(path: Path) -> str:
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        raise OpError("沙箱缺少 pypdf 库（容器后端需重建镜像：python sandbox/build_image.py）",
+                      "missing_dependency")
+    reader = PdfReader(str(path))
+    pages = []
+    for i, page in enumerate(reader.pages, 1):
+        text = (page.extract_text() or "").strip()
+        pages.append(f"--- 第 {i} 页 ---\n{text}")
+    return "\n".join(pages)
+
+
+def _extract_excel(path: Path) -> str:
+    try:
+        import pandas as pd
+    except ImportError:
+        raise OpError("沙箱缺少 pandas/openpyxl 库（容器后端需重建镜像：python sandbox/build_image.py）",
+                      "missing_dependency")
+    sheets = pd.read_excel(path, sheet_name=None)
+    blocks = []
+    for name, df in sheets.items():
+        blocks.append(f"--- 工作表: {name}（{df.shape[0]} 行 × {df.shape[1]} 列）---")
+        # 单表最多导出前 1000 行，防止一个巨型表吃光字符配额
+        blocks.append(df.head(1000).to_csv(index=False))
+    return "\n".join(blocks)
+
+
+_EXTRACTORS = {
+    ".docx": _extract_docx,
+    ".pdf": _extract_pdf,
+    ".xlsx": _extract_excel,
+    ".xls": _extract_excel,
+}
+
+
+def op_extract_document(params: dict) -> dict:
+    """把 docx / pdf / xlsx 解析成纯文本（含表格），带字符上限截断。
+
+    与 read_file 的分工：文本类格式（.md/.txt/.json/.csv/.log）走 read_file，
+    二进制文档格式走这里。路径校验同 read_file（允许 uploads 只读区）。
+    """
+    rel = str(params.get("path", ""))
+    max_chars = int(params.get("max_chars", MAX_EXTRACT_CHARS))
+    try:
+        target = Path(guard_within_sandbox(rel, allow_uploads=True))
+    except Exception as exc:
+        return _err(f"路径被沙箱拒绝：{exc}", "sandbox_path_denied")
+
+    if not target.exists():
+        return _err(f"文件不存在：{rel}", "not_found")
+    if target.is_dir():
+        return _err(f"{rel} 是目录不是文件", "is_directory")
+
+    extractor = _EXTRACTORS.get(target.suffix.lower())
+    if extractor is None:
+        return _err(f"后缀 {target.suffix!r} 不支持文档解析；文本类格式请使用 read_file，"
+                    f"支持的文档格式：{sorted(DOCUMENT_SUFFIXES)}", "unsupported_suffix")
+
+    try:
+        text = extractor(target)
+    except OpError as exc:
+        return _err(str(exc), exc.code)
+    except Exception as exc:
+        return _err(f"文档解析失败：{type(exc).__name__}: {exc}", "extract_failed")
+
+    truncated = len(text) > max_chars
+    if truncated:
+        text = text[:max_chars] + f"\n\n[内容过长，已截断至 {max_chars} 字符]"
+    return _ok(text, path=str(target), chars=len(text), truncated=truncated)
 
 
 def op_list_files(params: dict) -> dict:
@@ -398,6 +496,7 @@ def _probe_network() -> str:
 OPERATIONS = {
     "write_file": op_write_file,
     "read_file": op_read_file,
+    "extract_document": op_extract_document,
     "list_files": op_list_files,
     "md_to_pdf": op_md_to_pdf,
     "exec": op_exec,

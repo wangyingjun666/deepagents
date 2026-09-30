@@ -45,7 +45,7 @@ if str(project_root) not in sys.path:
 
 # Import agent runner and monitor
 # 注意：agent.main_agent 导入时会初始化 main_agent，耗时约几秒
-from agent.main_agent import run_deep_agent
+from agent.main_agent import close_checkpointer, init_checkpointer, run_deep_agent
 from api.monitor import manager, monitor
 from concurrency.db_pool import is_readonly_account_configured
 from concurrency.limiter import all_stats as limiter_stats
@@ -102,6 +102,9 @@ async def startup_event():
     """
     loop = asyncio.get_running_loop()
     manager.set_loop(loop)             # 内部会一并 event_bus.bind_loop(loop)
+    # checkpointer 必须在第一个请求（惰性构图）之前就绪，startup 钩子天然满足时序
+    persistent = await init_checkpointer()
+    print(f"[Server] 持久化 checkpointer：{'AsyncSqliteSaver 就绪' if persistent else '未启用（不落盘）'}")
     probe = sandbox_manager.probe()
     print(f"[Server] WebSocket Manager bound to loop: {id(loop)}")
     print(f"[Server] 沙箱后端：{probe.get('effective')}  "
@@ -112,8 +115,9 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """退出时清理沙箱（避免留下孤儿容器/进程），并关闭事件落盘句柄。"""
+    """退出时清理沙箱（避免留下孤儿容器/进程），关闭 checkpointer 连接与事件落盘句柄。"""
     await sandbox_manager.shutdown()
+    await close_checkpointer()
     event_store.close()
 
 

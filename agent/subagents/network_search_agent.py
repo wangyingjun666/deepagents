@@ -1,12 +1,6 @@
-# 目标： 创建网络搜索子智能体
-# 方式1： dict -> deepagents  方式： compiledSubAgent -> langchain langgraph
-from agent.prompts import sub_agents_content
+# 目标： 创建网络搜索子智能体（第一路信息源域：公网信息）
+# 方式1： dict -> deepagents  方式2： compiledSubAgent -> langchain langgraph
+from agent.subagents import build_subagent
 from tools.tavily_tool import internet_search
 
-
-network_search_agent = {
-    "name":sub_agents_content['tavily']['name'],
-    "description":sub_agents_content['tavily']['description'],
-    "system_prompt":sub_agents_content['tavily']['system_prompt'],
-    "tools":[internet_search]
-}
+network_search_agent = build_subagent("tavily", [internet_search])

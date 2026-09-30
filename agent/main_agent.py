@@ -15,17 +15,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 from pathlib import Path
 
 from langchain_core.messages import AIMessage
 
-from langgraph.checkpoint.memory import InMemorySaver
-
-# main_agent tool导入
+# main_agent tool导入（文件读取已移交文档解析子 Agent，主 Agent 只保留成文工具）
 from tools.markdown_tools import generate_markdown
 from tools.pdf_tools import convert_md_to_pdf
-from tools.upload_file_read_tool import read_file_content
 
 from deepagents import create_deep_agent
 
@@ -44,7 +42,7 @@ from agent.reflection import (
 )
 from agent.prompts import main_agent_content
 from agent.subagents.database_query_agent import database_query_agent
-from agent.subagents.knowledge_base_agent import knowledge_base_agent
+from agent.subagents.document_parse_agent import document_parse_agent
 from agent.subagents.network_search_agent import network_search_agent
 
 from api.context import (
@@ -75,38 +73,68 @@ INTERRUPT_ON = {
 }
 
 
-def build_checkpointer():
-    """构造持久化 checkpointer（同步 SqliteSaver）。
-
-    `InMemorySaver` 重启即丢、多 worker 各存一份，而且撑不住中断恢复：
-    审批要等用户确认，可能几十秒甚至跨进程重启，图状态必须能存下来。
-    """
-    import os
-    import sqlite3
-
-    from langgraph.checkpoint.sqlite import SqliteSaver
-
+def _checkpoint_db_path() -> Path:
     path = os.getenv("CHECKPOINT_DB", "data/checkpoints.sqlite")
     db_path = Path(path)
     if not db_path.is_absolute():
         db_path = Path(__file__).resolve().parents[1] / db_path
     db_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # 用同步 SqliteSaver 配 check_same_thread=False：LangGraph 的异步执行会把同步
-    # checkpointer 的调用丢到线程池里跑，连接会跨线程使用，而 SQLite 默认禁止跨线程
-    # 复用连接，必须显式放开。写并发由 LangGraph 的调用顺序保证，不会产生竞态。
-    conn = sqlite3.connect(str(db_path), check_same_thread=False)
-    return SqliteSaver(conn)
+    return db_path
 
 
-# 没有 SQLite 依赖时退回内存版，但明确告警（会影响中断恢复）
-try:
-    _checkpointer_cm = build_checkpointer()
-    CHECKPOINTER_PERSISTENT = True
-except Exception as exc:  # pragma: no cover
-    logger.warning("持久化 checkpointer 初始化失败（%s），退回内存版：中断恢复只能在同一进程内生效", exc)
-    _checkpointer_cm = None
+_checkpointer = None            # AsyncSqliteSaver 实例，服务 startup 时创建
+_checkpointer_conn = None       # 对应的 aiosqlite 连接，shutdown 时关闭
+CHECKPOINTER_PERSISTENT = False
+
+
+async def init_checkpointer() -> bool:
+    """在服务 startup 钩子里创建持久化 checkpointer（AsyncSqliteSaver）。
+
+    为什么必须是异步版：图是用 `astream` 跑的，同步 `SqliteSaver` 不支持异步方法，
+    LangGraph 会直接抛 "The SqliteSaver does not support async methods"，任务根本
+    执行不下去。`InMemorySaver` 则重启即丢、撑不住中断恢复——审批要等用户确认，
+    可能几十秒甚至跨进程重启，图状态必须能落盘。
+
+    时序约束：图实例是惰性构建的（`get_main_agent()`），必须在本函数之后才创建，
+    server 的 startup 钩子先于任何请求执行，天然满足。
+    初始化失败不崩服务：降级成 checkpointer=None（图仍能跑，只是不落盘）。
+    """
+    global _checkpointer, _checkpointer_conn, CHECKPOINTER_PERSISTENT
+
+    if os.getenv("CHECKPOINTER_ENABLED", "1").strip().lower() in ("0", "false", "no"):
+        logger.info("CHECKPOINTER_ENABLED=0，本次启动不启用持久化 checkpointer")
+        return False
+    try:
+        import aiosqlite
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+        db_path = _checkpoint_db_path()
+        _checkpointer_conn = await aiosqlite.connect(str(db_path))
+        saver = AsyncSqliteSaver(_checkpointer_conn)
+        await saver.setup()          # 建表 + 跑迁移，必须显式调一次
+        _checkpointer = saver
+        CHECKPOINTER_PERSISTENT = True
+        logger.info("持久化 checkpointer 就绪（AsyncSqliteSaver）：%s", db_path)
+        return True
+    except Exception as exc:  # pragma: no cover
+        logger.warning("持久化 checkpointer 初始化失败（%s），本次启动不落盘：中断恢复不可用", exc)
+        _checkpointer = None
+        CHECKPOINTER_PERSISTENT = False
+        return False
+
+
+async def close_checkpointer() -> None:
+    """服务 shutdown 时关闭 aiosqlite 连接。"""
+    global _checkpointer, _checkpointer_conn, CHECKPOINTER_PERSISTENT
+    conn = _checkpointer_conn
+    _checkpointer = None
+    _checkpointer_conn = None
     CHECKPOINTER_PERSISTENT = False
+    if conn is not None:
+        try:
+            await conn.close()
+        except Exception:  # pragma: no cover
+            logger.exception("关闭 checkpointer 连接失败（已忽略）")
 
 
 # 长期记忆库：起不来就降级成「不启用记忆」，但不能拖垮整个服务
@@ -122,7 +150,7 @@ except Exception as exc:  # pragma: no cover
 
 def _make_agent():
     """延迟创建图，避免在模块导入期就初始化 checkpointer 与模型。"""
-    checkpointer = _checkpointer_cm
+    checkpointer = _checkpointer
 
     # 长期记忆三件套缺一不可：
     #   store   —— 持久化底座（LangGraph BaseStore）
@@ -136,20 +164,21 @@ def _make_agent():
             "memory": MEMORY_SOURCES,
         }
 
+    # 三路子 Agent 对应三个正交信息源域（公网 / 数据库 / 上传文档），互相独立可并行委派
     return create_deep_agent(
         model=model,
         system_prompt=main_agent_content["system_prompt"],
-        tools=[generate_markdown, convert_md_to_pdf, read_file_content],
+        tools=[generate_markdown, convert_md_to_pdf],
         checkpointer=checkpointer,
         subagents=[
             database_query_agent,
             network_search_agent,
-            knowledge_base_agent,
+            document_parse_agent,
         ],
         interrupt_on=INTERRUPT_ON,
         context_schema=MemoryContext,
         **memory_kwargs,
-    ).with_config({"recursion_limit": int(__import__("os").getenv("AGENT_RECURSION_LIMIT", "40"))})
+    ).with_config({"recursion_limit": int(os.getenv("AGENT_RECURSION_LIMIT", "40"))})
 
 
 # recursion_limit 通过 AGENT_RECURSION_LIMIT 配置，默认 40。框架默认是 1000，
@@ -225,7 +254,7 @@ async def _run_session(task_query: str, session_id: str, principal: SessionPrinc
             shutil.copy2(uploads_dir / filename, session_dir / filename)
         updated_info_prompt = ("\n    [已上传文件] 已加载到工作目录:\n"
                                + "\n".join([f"    - {f}" for f in files])
-                               + "\n    请优先使用工具（read_file_content）读取并参考这些文件。")
+                               + "\n    请委派**文档解析助手**读取并参考这些文件（把文件名原样传给它，不带目录前缀）。")
 
     # ---- ③④⑤ 沙箱 + 上下文绑定 ----
     tokens = {}
@@ -276,9 +305,9 @@ async def _stream_graph(task_query: str, session_id: str, workdir: str,
 
     规则：
     1. 新生成文件必须保存到工作目录：'{workdir}/filename'
-    2. 读取已上传的文件时，请直接将文件名（例如：'开篇.txt'）作为 filename 参数传入（read_file_content）读取工具，不要带上任何目录前缀。
+    2. 读取已上传的文件时，委派**文档解析助手**处理，并把文件名原样传达给它（例如：'开篇.txt'），不要带上任何目录前缀。
     3. 使用相对路径，禁止使用绝对路径
-    4. 若存在上传文件，请先分析内容
+    4. 若存在上传文件，请先委派文档解析助手分析内容，再进行后续步骤
     """
 
     config = {"configurable": {"thread_id": session_id}}
@@ -342,7 +371,7 @@ async def _run_graph_once(agent, payload, config, run_context, session_id: str) 
     from langgraph.types import Command
 
     latest_answer = ""
-    max_resumes = int(__import__("os").getenv("MAX_APPROVAL_ROUNDS", "5"))
+    max_resumes = int(os.getenv("MAX_APPROVAL_ROUNDS", "5"))
     for round_no in range(max_resumes + 1):
         interrupted = False
         async for chunk in agent.astream(payload, config=config, context=run_context):

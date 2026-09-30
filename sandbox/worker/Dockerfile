@@ -31,8 +31,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && fc-cache -f
 
+# markdown: md -> html 中转;其余三个是 read_file_content 的文档解析依赖(docx/pdf/xlsx)
 RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
-        markdown==3.10.2
+        markdown==3.10.2 \
+        python-docx==1.2.0 \
+        pypdf==6.7.2 \
+        pandas==3.0.1 \
+        openpyxl==3.1.5
 
 # --- 非 root 用户 ---
 RUN useradd --uid 1000 --create-home --shell /usr/sbin/nologin sandbox

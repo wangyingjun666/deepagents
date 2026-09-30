@@ -26,7 +26,7 @@ aiofiles==25.1.0
 
 # --- 外部服务集成 ---
 tavily-python==0.7.21          # 联网搜索（可选）
-ragflow-sdk==0.24.0            # RAGFlow 知识库（可选）
+ragflow-sdk==0.24.0            # RAGFlow 知识库子 Agent 已摘除挂载（tools/ragflow_tools.py 保留），依赖留着供恢复
 mysql-connector-python==9.6.0  # MySQL 数据库
 
 # --- 配置 / 请求 ---
@@ -37,9 +37,9 @@ typing-extensions==4.15.0
 
 # --- 文件处理（Markdown / Word / PDF / Excel 读取）---
 markdown==3.10.2               # MD -> HTML 中转，PDF 渲染用
-python-docx==1.2.0             # Word 读取
-pypdf==6.7.2                   # PDF 读取
-pandas==3.0.1                  # Excel 读取
+python-docx==1.2.0             # 文档解析子 Agent：Word 提取（沙箱内）
+pypdf==6.7.2                   # 文档解析子 Agent：PDF 提取（沙箱内）
+pandas==3.0.1                  # 文档解析子 Agent：Excel 提取（沙箱内）
 openpyxl==3.1.5                # Excel 引擎
 pywin32==311                   # 本机 Word COM 转 PDF，仅在无 Docker 时兜底（需装 Office）
 

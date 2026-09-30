@@ -110,7 +110,7 @@ def main() -> int:
                     help="跳过持久化 checkpointer（默认开，见下方说明）")
     ap.add_argument("--keep-checkpointer", dest="disable_checkpointer",
                     action="store_false",
-                    help="保留持久化 checkpointer（当前代码下会因同步/异步不兼容而报错）")
+                    help="保留持久化 checkpointer（AsyncSqliteSaver，结果将包含落盘开销）")
     args = ap.parse_args()
 
     # 压测环境的默认配置：本机没有 Docker / MySQL / 外部 Key 时也能整条链路跑起来
@@ -125,15 +125,12 @@ def main() -> int:
     install_stub(args.model_latency_ms, args.profile)
 
     if args.disable_checkpointer:
-        # 当前 main_agent 用的是同步 SqliteSaver，而图是用 astream 异步跑的，
-        # LangGraph 会直接抛 "The SqliteSaver does not support async methods"，
-        # 任务根本执行不下去。压测时先把它摘掉（checkpointer=None，图仍能跑，只是
-        # 不落盘、不支持跨进程中断恢复）。
-        #
-        # 注意：这意味着压测结果里**不含 checkpoint 落盘开销**，真实数字会比这里高。
-        import agent.main_agent as ma
-        ma._checkpointer_cm = None
-        print("[Bench] 已关闭持久化 checkpointer（同步 SqliteSaver 与异步执行不兼容）")
+        # checkpointer 已换成 AsyncSqliteSaver（同步版与 astream 不兼容的 bug 已修），
+        # 压测默认仍然关闭它：一是让结果与历史数据（不含 checkpoint 落盘开销）可比，
+        # 二是隔离落盘 IO 对编排层开销测量的干扰。通过 CHECKPOINTER_ENABLED=0 生效，
+        # 必须赶在 api.server 导入前设置（startup 钩子会读这个开关）。
+        os.environ["CHECKPOINTER_ENABLED"] = "0"
+        print("[Bench] 已关闭持久化 checkpointer（压测口径：结果不含 checkpoint 落盘开销）")
 
     import uvicorn
     from api.server import app

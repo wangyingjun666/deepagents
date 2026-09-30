@@ -134,6 +134,11 @@ class SandboxBackend(abc.ABC):
     async def read_file(self, rel_path: str, *, max_bytes: int = 2_000_000) -> ExecResult:
         return await self._invoke("read_file", {"path": rel_path, "max_bytes": max_bytes})
 
+    async def extract_document(self, rel_path: str, *, max_chars: int = 200_000) -> ExecResult:
+        """沙箱内解析 docx / pdf / xlsx 并提取为纯文本（不可信文件的解析不进宿主）。"""
+        return await self._invoke("extract_document", {"path": rel_path, "max_chars": max_chars},
+                                  timeout=max(self.spec.exec_timeout_sec, 120))
+
     async def list_files(self, rel_dir: str = ".") -> ExecResult:
         return await self._invoke("list_files", {"path": rel_dir})
 
