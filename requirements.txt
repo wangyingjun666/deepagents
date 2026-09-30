@@ -26,7 +26,6 @@ aiofiles==25.1.0
 
 # --- 外部服务集成 ---
 tavily-python==0.7.21          # 联网搜索（可选）
-ragflow-sdk==0.24.0            # RAGFlow 知识库子 Agent 已摘除挂载（tools/ragflow_tools.py 保留），依赖留着供恢复
 mysql-connector-python==9.6.0  # MySQL 数据库
 
 # --- 配置 / 请求 ---

@@ -2,7 +2,7 @@
 并发限制器：给会打下游的动作装闸门。
 
 并发有三层来源：多用户会话、单任务内的多个子 Agent、单轮内的多个工具调用。它们最终
-都汇聚到同一批下游：LLM API、Tavily、RAGFlow、MySQL。不限制的后果是级联失败：下游
+都汇聚到同一批下游：LLM API、Tavily、MySQL。不限制的后果是级联失败：下游
 限流 → 重试 → 流量被放大 → 更多 429 → 重试耗尽 → 工具返回错误字符串 → 用户感知到的
 是"答案质量下降"，而不是一个明确的报错。
 
@@ -135,7 +135,6 @@ subagent_limiter = Limiter("subagent", _env_int("MAX_CONCURRENT_SUBAGENTS", 3),
 DOWNSTREAM_CAPACITY = {
     "llm": _env_int("MAX_CONCURRENT_LLM", 8),
     "tavily": _env_int("MAX_CONCURRENT_TAVILY", 4),
-    "ragflow": _env_int("MAX_CONCURRENT_RAGFLOW", 4),
     "mysql": _env_int("MAX_CONCURRENT_MYSQL", 8),
 }
 downstream_limiters: dict[str, Limiter] = {

@@ -40,7 +40,6 @@ class Capability(str, Enum):
     DB_QUERY_WRITE = "db:query:write"        # 允许写语句（默认不授予任何角色）
     # 外部数据源
     NET_SEARCH = "net:search"                # 联网检索
-    KB_QUERY = "kb:query"                    # 内部知识库检索
     # 交付物
     DOC_RENDER = "doc:render"                # 文档生成 / PDF 渲染
     # 危险能力
@@ -61,14 +60,12 @@ class Role(str, Enum):
 ROLE_CAPABILITIES: dict[Role, FrozenSet[Capability]] = {
     Role.GUEST: frozenset({
         Capability.NET_SEARCH,
-        Capability.KB_QUERY,
     }),
     Role.USER: frozenset({
         Capability.FS_READ_SESSION,
         Capability.FS_WRITE_SESSION,
         Capability.FS_READ_UPLOAD,
         Capability.NET_SEARCH,
-        Capability.KB_QUERY,
         Capability.DB_QUERY,
         Capability.DOC_RENDER,
     }),
@@ -77,7 +74,6 @@ ROLE_CAPABILITIES: dict[Role, FrozenSet[Capability]] = {
         Capability.FS_WRITE_SESSION,
         Capability.FS_READ_UPLOAD,
         Capability.NET_SEARCH,
-        Capability.KB_QUERY,
         Capability.DB_QUERY,
         Capability.DOC_RENDER,
     }),
